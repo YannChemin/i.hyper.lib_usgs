@@ -31,6 +31,32 @@ downloaded archive. **input_dir** must point at the root of that download
 (e.g. `~/DBDATA/usgs_splib07`), containing its `ASCIIdata/` and
 `HTMLmetadata/` subdirectories as distributed.
 
+### Downloading the data
+
+1. Go to the data release's ScienceBase landing page:
+   [https://doi.org/10.5066/F7RR1WDJ](https://doi.org/10.5066/F7RR1WDJ)
+   (Kokaly and others, 2017, *USGS Spectral Library Version 7 Data*, USGS
+   data release). The companion report describing the library's contents
+   and instruments is at
+   [https://doi.org/10.3133/ds1035](https://doi.org/10.3133/ds1035)
+   (Data Series 1035).
+2. On the ScienceBase page, download the ASCII spectra archive (the file
+   distributed as `ASCIIdata.zip` or similar, containing
+   `ASCIIdata_splib07a/` -- the native-resolution measurements this
+   harvester reads) and the HTML sample metadata archive (`HTMLmetadata.zip`).
+   The page also offers `SPECPRsplib07/`, `GIFplots/`, and the oversampled
+   `splib07b`/sensor-convolved sublibraries; none of those are needed by
+   this harvester (see Notes).
+3. Extract both archives into one common root directory, e.g.
+   `~/DBDATA/usgs_splib07/`, so that it directly contains an `ASCIIdata/`
+   subdirectory (with `ASCIIdata_splib07a/` inside it) and an
+   `HTMLmetadata/` subdirectory as siblings -- this combined root is what
+   **input_dir** must point at.
+4. The full download is a few GB; only `ASCIIdata_splib07a/` (a few
+   hundred MB) and `HTMLmetadata/` are actually read by this harvester,
+   but both must be present at ingestion time since sample metadata is
+   joined in from the latter per spectrum file.
+
 ### Why this needed its own parser (not shared with i.hyper.lib_ecosis)
 
 USGS splib07a's on-disk layout is structurally different from EcoSIS's
