@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>i.hyper.lib_usgs - GRASS GIS manual</title>
+<meta charset="utf-8">
+</head>
+<body>
+
+<h2>DESCRIPTION</h2>
+
+<p><em>i.hyper.lib_usgs</em> is the second <b>i.hyper.lib_*</b> harvester
+(after <em>i.hyper.lib_ecosis</em>): it parses a local download of the USGS
+Spectral Library Version 7 data release (Kokaly and others, 2017,
+<a href="https://doi.org/10.3133/ds1035">https://doi.org/10.3133/ds1035</a>)
+and writes it into the <b>same shared, source-tagged database</b> at
+<code>$HOME/grassdata/hyperspeclib</code>, using the exact same row schema
+as <em>i.hyper.lib_ecosis</em> &mdash; so a query spanning both harvesters'
+data (lab mineral/vegetation/organic-compound reference spectra alongside
+field-collected EcoSIS spectra) is a single <code>pyarrow.dataset</code>
+scan, no per-source glue code needed.</p>
+
+<p>Unlike EcoSIS, USGS's data release has no live query API &mdash; it is a
+static downloaded archive. <b>input_dir</b> must point at the root of that
+download (e.g. <code>~/DBDATA/usgs_splib07</code>), containing its
+<code>ASCIIdata/</code> and <code>HTMLmetadata/</code> subdirectories as
+distributed.</p>
+
+<h3>Why this needed its own parser (not shared with i.hyper.lib_ecosis)</h3>
+
+<p>USGS splib07a's on-disk layout is structurally different from EcoSIS's
+<code>{dataset_info, spectra}</code> JSON, and was studied via the reference
+USGS/RELAB parsers in
+<code>$HOME/dev/spectral/spectral/database/{usgs,relab}.py</code> (the
+<code>spectral</code> Python package) for its parsing conventions &mdash;
+not used as a dependency, reimplemented here to fit this module's own
+schema and streaming/batched-write architecture:</p>
+
+<ul>
+  <li><b>Spectra and wavelengths are in separate files.</b> Each sample is
+    one <code>splib07a_&lt;Name&gt;_&lt;Instrument&gt;&lt;Purity&gt;_&lt;Type&gt;.txt</code>
+    file (e.g. <code>splib07a_Kaolinite_CM5_BECKb_AREF.txt</code>) under one
+    of seven <code>Chapter*</code> subdirectories, holding only reflectance
+    values, one per line, in the order defined by a <i>shared</i>
+    per-instrument wavelength file
+    (<code>splib07a_Wavelengths_&lt;FAMILY&gt;_...txt</code>, four
+    native-resolution instrument families in splib07a: <b>ASD</b> (2151
+    channels, 0.35-2.5&micro;m), <b>BECK</b> (480 ch, 0.2-3.0&micro;m),
+    <b>NIC4</b> (4595 ch, 1.12-216&micro;m), <b>AVIRIS</b> (224 ch,
+    0.37-2.5&micro;m)). A sample's own header line names its instrument
+    (e.g. <code>BECKb</code>), which this module matches against the
+    pre-parsed wavelength table for that family and aligns by position.</li>
+  <li><b>Deleted/bad channels</b> are marked <code>-1.23e34</code> in the
+    value files (not simply absent) and are filtered out, same as EcoSIS's
+    unparseable datapoints.</li>
+  <li><b>Sample header line</b> (<code>splib07a Record=5932: Kaolinite CM5
+    BECKb AREF</code>) is whitespace-tokenized (mirroring the reference
+    parser): the record number, a free-text description, the
+    instrument+purity code, and the measurement subtype
+    (AREF/RREF/RTGC/...) are all packed into one line with no delimiters
+    other than spaces, so field boundaries are inferred positionally
+    (first two tokens, last two tokens, everything else is the
+    description).</li>
+  <li><b>Rich per-sample metadata</b> lives in a <i>separate</i>
+    <code>HTMLmetadata/&lt;same base name&gt;.html</code> file per sample,
+    in an informal but consistent <code>&lt;p&gt; KEYWORD: value</code>
+    convention across every chapter (<code>DOCUMENTATION_FORMAT</code>
+    differs &mdash; MINERAL, PLANT, MIXTURE, ... &mdash; but the KEYWORD:
+    value structure holds throughout), which a single generic parser
+    extracts into <code>extra_metadata</code> without a per-chapter field
+    schema: mineral/plant name, chemical formula, sample ID, collection
+    locality, donor, spectral purity notes, etc. (The composition-analysis
+    <code>&lt;TABLE&gt;</code> some mineral pages include is not parsed
+    &mdash; it's real tabular HTML, not KEYWORD: value text &mdash; but
+    remains reachable via the preserved <code>local_metadata_html</code>
+    path.)</li>
+</ul>
+
+<h3>Dataset grouping</h3>
+
+<p>USGS splib07a has no natural per-download "dataset" grouping the way
+EcoSIS does; the seven <code>Chapter*_&lt;Name&gt;</code> subdirectories
+(Artificial Materials, Coatings, Liquids, Minerals, Organic Compounds,
+Soils and Mixtures, Vegetation) are the natural granularity instead, so
+each chapter becomes one <code>dataset_id</code> / one Parquet file,
+exactly as one EcoSIS package becomes one file. Every individual
+instrument measurement file is kept as its own row (no attempt to pick one
+"canonical" instrument per physical sample when several exist) &mdash;
+complete and non-lossy, consistent with how EcoSIS records are stored as
+submitted.</p>
+
+<p><b>chapters=</b> restricts ingestion to specific chapters (default: all
+seven).</p>
+
+<h3>No geolocation</h3>
+
+<p>USGS lab samples have no coordinates (a <code>COLLECTION_LOCALITY</code>
+free-text field exists for some, e.g. "Lamar Pit, Bath S.C.", but it is not
+structured lat/lon) &mdash; <code>longitude</code>/<code>latitude</code>
+are always null for this source, same nullable columns EcoSIS's
+non-georeferenced leaf-level datasets already use. A shared library query
+does not need to special-case this: a bounding-box filter simply matches
+zero USGS rows, an attribute/text query over
+<code>dataset_title</code>/<code>extra_metadata</code> works identically
+for both sources.</p>
+
+<h3>No live per-record web page (unlike EcoSIS)</h3>
+
+<p>The DS1035 data release has no per-sample API or web page &mdash;
+<b>source_url</b> is the citation DOI
+(<code>https://doi.org/10.3133/ds1035</code>) and <b>source_api_url</b> the
+ScienceBase data release landing page
+(<code>https://dx.doi.org/10.5066/F7RR1WDJ</code>) for every row from this
+source. Full per-record traceability instead comes from
+<code>extra_metadata</code>'s <code>local_spectrum_file</code> and
+<code>local_metadata_html</code> paths, pointing back at the exact files
+this run read.</p>
+
+<h3>Incremental re-runs and streaming</h3>
+
+<p>Same conventions as <em>i.hyper.lib_ecosis</em>: a shared
+<code>_manifest.json</code> at the database root (one entry per
+harvester+dataset, keyed <code>usgs_splib07:&lt;chapter&gt;</code>) tracks
+each chapter's <i>source</i> file count (<code>expected_total</code>) to
+decide whether a re-run can skip it (<b>-f</b> to force), and records are
+batched (<b>stream_batch_size</b>, default 2000) and written incrementally
+via the same <code>ParquetWriter</code>/<code>executemany()</code>
+per-batch pattern &mdash; though splib07a's individual files are tiny (a
+few KB each, 2457 files total), so this matters far less here than for
+EcoSIS's occasional multi-GB single file; it is kept for architectural
+consistency between harvesters, not because it is load-bearing at this
+scale.</p>
+
+<h2>NOTES</h2>
+
+<p>Use <b>-k</b> to keep going past a sample file that fails to parse or
+has no matching wavelength table, instead of aborting the whole run.</p>
+
+<p>Only the native-resolution <b>splib07a</b> measurements are ingested,
+not the oversampled <code>splib07b</code> or the sensor-convolved
+sublibraries (<code>s07_ASD</code>, <code>s07_AVxx</code>, CRISM,
+Sentinel2, Landsat8, WorldView3, ...) &mdash; those are a much larger,
+resampled-for-a-specific-sensor corpus, out of scope for this harvester.</p>
+
+<h2>EXAMPLES</h2>
+
+<h3>Ingest a single (small) chapter, SQLite backend</h3>
+
+<div class="code"><pre>
+i.hyper.lib_usgs input_dir=$HOME/DBDATA/usgs_splib07 \
+    output=/tmp/test_usgs_lib format=sqlite chapters=ChapterC_Coatings
+</pre></div>
+
+<div class="code"><pre>
+Loading splib07a instrument wavelength tables&hellip;
+Instrument families available: ['ASD', 'AVIRIS', 'BECK', 'NIC4']
+Wrote 12 record(s) for 'ChapterC_Coatings' &rarr;
+/tmp/test_usgs_lib/hyperspeclib.sqlite
+Done: 1 chapter(s) ingested (12 spectra), 0 already up to date, library at
+/tmp/test_usgs_lib (format=sqlite).
+</pre></div>
+
+<p>One of those 12 rows, inspected directly:</p>
+
+<div class="code"><pre>
+record_id:          splib07a_Blck_Mn_Coat_Tailngs_LV95-3_BECKb_AREF
+dataset_title:      Coatings
+n_bands:            453                 (of BECK's 480 -- 27 deleted channels dropped)
+wavelengths[:3]:    [301.1, 305.1, 309.1]   (nm; BECK file is in microns, x1000)
+extra_metadata:
+  documentation_format: MIXTURE
+  sample_id:            LV95-3
+  mixture:              Mn-coating on rock
+  collection_locality:  Leadville Mining District, Leadville, Colorado, USA
+  original_donor:       Gregg Swayze
+  instrument_code:      BECKb
+  usgs_record_number:   13425
+  local_spectrum_file:  .../ChapterC_Coatings/splib07a_Blck_Mn_Coat_Tailngs_LV95-3_BECKb_AREF.txt
+  local_metadata_html:  .../HTMLmetadata/Blck_Mn_Coat_Tailngs_LV95-3_BECKb_AREF.html
+</pre></div>
+
+<h3>Full library: all seven chapters into the shared database</h3>
+
+<div class="code"><pre>
+i.hyper.lib_usgs input_dir=$HOME/DBDATA/usgs_splib07
+</pre></div>
+
+<div class="code"><pre>
+Loading splib07a instrument wavelength tables&hellip;
+Instrument families available: ['ASD', 'AVIRIS', 'BECK', 'NIC4']
+Wrote 290 record(s) for 'ChapterA_ArtificialMaterials' &rarr; .../dataset_ChapterA_ArtificialMaterials.parquet
+Wrote 12 record(s) for 'ChapterC_Coatings' &rarr; .../dataset_ChapterC_Coatings.parquet
+Wrote 24 record(s) for 'ChapterL_Liquids' &rarr; .../dataset_ChapterL_Liquids.parquet
+Wrote 1276 record(s) for 'ChapterM_Minerals' &rarr; .../dataset_ChapterM_Minerals.parquet
+Wrote 360 record(s) for 'ChapterO_OrganicCompounds' &rarr; .../dataset_ChapterO_OrganicCompounds.parquet
+Wrote 209 record(s) for 'ChapterS_SoilsAndMixtures' &rarr; .../dataset_ChapterS_SoilsAndMixtures.parquet
+Wrote 286 record(s) for 'ChapterV_Vegetation' &rarr; .../dataset_ChapterV_Vegetation.parquet
+Done: 7 chapter(s) ingested (2457 spectra), 0 already up to date, library
+at /home/yann/grassdata/hyperspeclib (format=parquet).
+</pre></div>
+
+<p>Re-running the same command afterward is fully idempotent (<code>0
+chapter(s) ingested ... 7 already up to date</code>).</p>
+
+<h3>Querying across both harvested sources at once</h3>
+
+<p><em>i.hyper.lib_ecosis</em> had already populated the same library root
+with 195 EcoSIS datasets before this ran; both sources now live side by
+side under their own <code>source_database=</code> partition, queryable
+together in one scan:</p>
+
+<div class="code"><pre>
+import pyarrow.dataset as ds
+
+dataset = ds.dataset("/home/yann/grassdata/hyperspeclib", format="parquet", partitioning="hive")
+table = dataset.to_table(columns=["source_database"])
+print(table.to_pandas()["source_database"].value_counts())
+</pre></div>
+
+<div class="code"><pre>
+source_database
+ecosis          229893
+usgs_splib07      2457
+</pre></div>
+
+<p>Finding every USGS record for a specific mineral, by filename convention
+(a real per-source, per-name lookup a future spectral-matching
+<em>i.hyper.*</em> module would do):</p>
+
+<div class="code"><pre>
+table = dataset.to_table(
+    columns=["record_id"],
+    filter=(ds.field("source_database") == "usgs_splib07")
+           &amp; (ds.field("dataset_id") == "ChapterM_Minerals")
+           &amp; ds.field("record_id").utf8_startswith("splib07a_Kaolinite_CM5"),
+)
+# -&gt; splib07a_Kaolinite_CM5_BECKb_AREF, splib07a_Kaolinite_CM5_NIC4bb_RREF
+#    (two instrument measurements of the same physical sample, both kept)
+</pre></div>
+
+<h2>SEE ALSO</h2>
+
+<em>
+<a href="i.hyper.lib_ecosis.html">i.hyper.lib_ecosis</a>,
+<a href="i.hyper.spectroscopy.html">i.hyper.spectroscopy</a>,
+<a href="i.hyper.endmembers.html">i.hyper.endmembers</a>
+</em>
+
+<p>USGS Spectral Library Version 7: Kokaly, R.F., Clark, R.N., Swayze,
+G.A., Livo, K.E., Hoefen, T.M., Pearson, N.C., Wise, R.A., Benzel, W.M.,
+Lowers, H.A., Driscoll, R.L., and Klein, A.J., 2017, U.S. Geological
+Survey Data Series 1035, 61 p.,
+<a href="https://doi.org/10.3133/ds1035">https://doi.org/10.3133/ds1035</a></p>
+
+<p>Data release: <a href="https://doi.org/10.5066/F7RR1WDJ">https://doi.org/10.5066/F7RR1WDJ</a></p>
+
+<p>GeoParquet specification: <a href="https://geoparquet.org">https://geoparquet.org</a></p>
+
+<h2>AUTHOR</h2>
+
+Spectral Feature Extraction and Interpretation Engine
+
+</body>
+</html>
